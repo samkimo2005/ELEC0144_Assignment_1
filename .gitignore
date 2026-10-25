@@ -4,6 +4,8 @@
 
 # Except the Python source file
 !/Task_1.py
+!/WhatIf_Task_1.py
+!/Task_1_viva.py
 
 # Keep .gitignore itself
 !/.gitignore

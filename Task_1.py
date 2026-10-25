@@ -1,3 +1,20 @@
+# CODE MAP of Task_1.py
+# 1. Imports and Configuration                             Import required libraries and define settings
+# 2. Image Loading                                         Load Fruits.jpg
+# 3. Preprocessing                                         Apply brightness scaling and horizontal mirroring
+# 4. Colour Segmentation                                   Generate fruit masks using normalised RGB
+# 5. Connected Component Analysis                          Find connected foreground components
+# 6. Blob Selection                                        Filter and rank candidate fruit blobs
+# 7. Region Growing and Diagnostic Statistics              Refine fruit regions and report diagnostics
+# 8. Geometric Feature Extraction                          Compute bounding boxes, centroids and areas
+# 9. Experimental Utility: Candidate Blob Visualisation    Display ranked blob candidates
+# 10. Experimental Utility: Pixel Growth Visualisation     Display seed pixels and newly grown pixels
+# 11. Experimental Utility: Bounding Box Comparison        Compare bounding boxes before and after growth
+# 12. Fruit Processing Pipeline                            Run detection and feature extraction per fruit
+# 13. Final Results Visualisation                          Display and save final detection results
+# 14. Main Pipeline                                        Execute the complete processing pipeline
+# AI use                                                   ChatGPT GPT-6
+
 # %% 1. Imports and Configuration
 
 from pathlib import Path
@@ -9,6 +26,12 @@ from matplotlib.lines import Line2D
 import numpy as np
 
 import matplotlib.pyplot as plt
+
+# %% Variable Definition of Dark Factor and Mirror 
+
+darkFactor = 0.6
+
+mirror = True
 
 # %% 2. Image Loading
 
@@ -1965,10 +1988,6 @@ def main():
     The diagnostic visualisations remain enabled exactly as in the source.
     This function uses the module-level image and output directory.
     """
-
-    darkFactor = 0.6
-
-    mirror = True
 
     # Step 1: Preprocessing
 
