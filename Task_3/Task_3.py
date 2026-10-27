@@ -1,4 +1,13 @@
 # Code Map
+# Step 0: Setup                Import required libraries.
+# Step 1: Preprocessing        Extract and prepare video frames.
+# Step 2: Feature Extraction   Extract edge and movement features.
+# Step 3: Classification       Construct five classification methods.
+# Shared Functions            Prepare inputs and predictions for CNNs and GoogLeNet.
+# Step 4: Training             Train five models, validate and select the best method.
+# Step 5: Evaluation           Calculate test accuracy and confusion matrix.
+# Main                         Load datasets and execute the classification pipeline.
+# AI use                       GPT-6
 
 # Step 0: Setup
 from pathlib import Path
@@ -125,7 +134,7 @@ def classification_cnn(method = "basic"):
             0.1, value_range = (0.0, 1.0)
         ))
 
-        model.add(tf.keras.layers.RandomContrast(0.1))
+        model.add(tf.keras.layers.RandomContrast(0.1, value_range=(0.0, 1.0)))
 
     # First Convolutional Layer
     model.add(tf.keras.layers.Conv2D(16, (3, 3), padding = "same"))
@@ -173,6 +182,32 @@ def classification_googlenet():
     
     return googlenet, classifier
 
+# Shared operations for Training, Validation and Test
+
+def select_cnn_frames(frame_lists):
+    return np.concatenate(
+        [frames[[2, 5, 9]] for frames in frame_lists], axis=0
+    ).astype(np.float32)
+
+
+def cnn_grip_predictions(model, images, number_of_grips):
+    probabilities = model.predict(images, batch_size=16, verbose=0)
+    probabilities = probabilities.reshape(number_of_grips, 3)
+    grip_probabilities = np.mean(probabilities, axis=1)
+    return (grip_probabilities >= 0.5).astype(int)
+
+
+def google_grip_features(googlenet, images, number_of_grips):
+    features = []
+
+    for i in range(0, len(images), 16):
+        batch = tf.convert_to_tensor(images[i:i + 16], dtype=tf.float32)
+        output = googlenet(batch)
+        features.append(output.numpy())
+
+    features = np.concatenate(features, axis=0)
+    return features.reshape(number_of_grips, 3, -1).mean(axis=1)
+
 # Step 4: Training
 
 def model_training(
@@ -184,10 +219,6 @@ def model_training(
         googlenet, google_classifier):
 
     results = {}
-
-    # Convert the list of features into NumPy arrays
-    X_train_mlp = np.array(training_features)
-    X_val_mlp = np.array(validation_features)
 
     # Convert the labels
     y_train = np.array(training_label)
@@ -220,15 +251,8 @@ def model_training(
     # --------------------------------------------------
 
     # Select three frames per grip from the original 12
-    X_train_cnn = np.concatenate(
-        [frames[[2, 5, 9]] for frames in training_frames],
-        axis=0
-    ).astype(np.float32)
-
-    X_val_cnn = np.concatenate(
-        [frames[[2, 5, 9]] for frames in validation_frames],
-        axis=0
-    ).astype(np.float32)
+    X_train_cnn = select_cnn_frames(training_frames)
+    X_val_cnn = select_cnn_frames(validation_frames)
 
     # Each grip's label is repeated for its three frames
     y_train_cnn = np.repeat(y_train, 3)
@@ -257,19 +281,8 @@ def model_training(
             batch_size=16
         )
 
-        # Predict probabilities for validation frames
-        probabilities = model.predict(
-            X_val_cnn,
-            batch_size=16,
-            verbose=0
-        )
-
-        # Average three frame predictions per grip
-        probabilities = probabilities.reshape(len(y_val), 3)
-        grip_probabilities = np.mean(probabilities, axis=1)
-
-        # Convert probabilities to Light (0) or Firm (1)
-        predictions = (grip_probabilities >= 0.5).astype(int)
+        # Predict one Light/Firm label for each validation grip
+        predictions = cnn_grip_predictions(model, X_val_cnn, len(y_val))
 
         # Calculate grip-level validation accuracy
         accuracy = accuracy_score(y_val, predictions)
@@ -283,33 +296,13 @@ def model_training(
 
     print("Training: GoogLeNet")
 
-    # Extract pre-trained visual features in small batches
-    def google_features(images):
-        features = []
-
-        for i in range(0, len(images), 16):
-            batch = tf.convert_to_tensor(
-                images[i:i + 16],
-                dtype=tf.float32
-            )
-
-            output = googlenet(batch)
-            features.append(output.numpy())
-
-        return np.concatenate(features, axis=0)
-
-    # Extract visual features from the RGB frames
-    X_train_google = google_features(X_train_cnn)
-    X_val_google = google_features(X_val_cnn)
-
-    # Average the three feature vectors belonging to each grip
-    X_train_google = X_train_google.reshape(
-        len(y_train), 3, -1
-    ).mean(axis=1)
-
-    X_val_google = X_val_google.reshape(
-        len(y_val), 3, -1
-    ).mean(axis=1)
+    # Extract and average pre-trained features for each grip
+    X_train_google = google_grip_features(
+        googlenet, X_train_cnn, len(y_train)
+    )
+    X_val_google = google_grip_features(
+        googlenet, X_val_cnn, len(y_val)
+    )
 
     # Train Logistic Regression on GoogLeNet features
     google_classifier.fit(X_train_google, y_train)
@@ -450,24 +443,37 @@ def main():
         cnn_basic, cnn_batchnorm, cnn_augmentation, 
         googlenet, google_classifier)
 
-# Step 5: Evaluation
+    # Step 5: Evaluation
     models = {
-    "MLP": mlp,
-    "Basic CNN": cnn_basic,
-    "CNN + BatchNorm": cnn_batchnorm,
-    "CNN + Augmentation": cnn_augmentation,
-    "GoogLeNet": google_classifier
+        "MLP": mlp,
+        "Basic CNN": cnn_basic,
+        "CNN + BatchNorm": cnn_batchnorm,
+        "CNN + Augmentation": cnn_augmentation,
+        "GoogLeNet": google_classifier
     }
     best_model = models[best_method]
 
-    test_accuracy, object_accuracies, matrix = evaluation(
-        test_features, test_frames, test_label, test_objects,
-        best_method, best_model, scaler, googlenet
-    )
+    # Generate predictions for the independent Test set
+    if best_method == "MLP":
+        X_test = scaler.transform(np.array(test_features, dtype=np.float32))
+        predictions = best_model.predict(X_test)
+    else:
+        X_test_cnn = select_cnn_frames(test_frames)
 
-    print("Overall Accuracy:", test_accuracy)
-    print("Object Accuracies:", object_accuracies)
-    print("Confusion Matrix:\n", matrix)
+        if best_method == "GoogLeNet":
+            X_test_google = google_grip_features(
+                googlenet, X_test_cnn, len(test_label)
+            )
+            predictions = best_model.predict(X_test_google)
+        else:
+            predictions = cnn_grip_predictions(
+                best_model, X_test_cnn, len(test_label)
+            )
+
+    # Calculate and display final Test metrics
+    test_accuracy, object_accuracies, matrix = evaluation(
+        test_label, test_objects, predictions
+    )
 
 if __name__ == "__main__":
     main()
