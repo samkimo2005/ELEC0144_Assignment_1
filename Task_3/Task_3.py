@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 import tensorflow as tf
 import tensorflow_hub as hub
+import csv
 
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.linear_model import LogisticRegression
@@ -366,6 +367,18 @@ def evaluation(test_label, test_objects, predictions):
 def main():
     location = Path(__file__).resolve().parent
 
+    with open(location / ".csv", "r", newline="") as file:
+        manifest = list(csv.reader(file))
+
+    clip_id = video_path.stem
+    record = next(row for row in manifest if row["clip_id"] == clip_id)
+    if record["grip"] == "light":
+        label = 0
+    else: 
+        label = 1
+    
+    object_type = record["object"]
+
     training_features = []
     validation_features = []
     test_features = []
@@ -391,20 +404,6 @@ def main():
             # Step 1: Preprocessing
             frames = preprocessing(video_path)
             print(folder_name, video_path.name, frames.shape)
-
-            if "_light_" in video_path.stem.lower():
-                label = 0
-            elif "_firm_" in video_path.stem.lower():
-                label = 1
-            else:
-                raise ValueError("Unknown label: " + video_path.name)
-             
-            if "foam_ball" in video_path.stem.lower():
-                object_type = "foam_ball"
-            elif "rigid_bottle" in video_path.stem.lower():
-                object_type = "rigid_bottle"
-            else:
-                raise ValueError("Unknown object: " + video_path.name)
 
             # Step 2: Visual feature extraction
             features = feature_extraction(frames)
