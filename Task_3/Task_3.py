@@ -15,10 +15,12 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.neural_network import MLPClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.pipeline import make_pipeline
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
 
 # Step 1: Import and preprocess the input videos
+
 def preprocessing(video_path):
-    video = cv2.VideoCapture(video_path)
+    video = cv2.VideoCapture(str(video_path))
     total_frames = int(video.get(cv2.CAP_PROP_FRAME_COUNT))
 
     if not video.isOpened() or total_frames == 0:
@@ -78,8 +80,8 @@ def feature_extraction(frames):
     edge_mean = np.mean(edge_frames, axis = 0)
 
     # Feature 2: change in edges between the start and the end of the grip
-    first_edges = np.mean(edge_frames[:,3], axis = 0)
-    last_edges = np.mean(edge_frames[-3,:], axis = 0)
+    first_edges = np.mean(edge_frames[:3], axis = 0)
+    last_edges = np.mean(edge_frames[-3:], axis = 0)
     edge_change = np.abs(last_edges - first_edges)
 
     # Feature 3: Average movement between the start and the end of the object
@@ -92,9 +94,11 @@ def feature_extraction(frames):
 
     # 256 features for each 16 x 16 image, so for each grip, 256 x 3 = 768 features for each grip
     # flatten(): Convert a 2D matrix into a 1D array with the same total number of elements
-    features = np.concatenate(edge_mean.flatten(),
-                             edge_change.flatten(),
-                             movement_mean.flatten())
+    features = np.concatenate(
+        (edge_mean.flatten(),
+         edge_change.flatten(),
+         movement_mean.flatten())
+         )
     return features.astype(np.float32)
 
 # Step 3: Construct the classification methods
@@ -115,7 +119,7 @@ def classification_cnn(method = "basic"):
     ])
 
     # Data Augmentation
-    if method == "Augmentation":
+    if method == "augmentation":
         model.add(tf.keras.layers.RandomBrightness(
             0.1, value_range = (0.0, 1.0)
         ))
@@ -125,7 +129,7 @@ def classification_cnn(method = "basic"):
     # First Convolutional Layer
     model.add(tf.keras.layers.Conv2D(16, (3, 3), padding = "same"))
 
-    if method == "Batch":
+    if method == "batch":
         model.add(tf.keras.layers.BatchNormalization())
 
     model.add(tf.keras.layers.ReLU())
@@ -134,7 +138,7 @@ def classification_cnn(method = "basic"):
     # Second Convolutional Layer
     model.add(tf.keras.layers.Conv2D(32, (3, 3), padding="same"))
 
-    if method == "Batch":
+    if method == "batch":
         model.add(tf.keras.layers.BatchNormalization())
 
     model.add(tf.keras.layers.ReLU())
@@ -169,19 +173,187 @@ def classification_googlenet():
     return googlenet, classifier
 
 # Step 4: Training
-def model_training():
-    return 0
+
+def model_training(
+        training_features, validation_features, 
+        training_label, validation_label,
+        training_frames, validation_frames,
+        mlp, 
+        cnn_basic, cnn_batchnorm, cnn_augmentation, 
+        googlenet, google_classifier):
+
+    results = {}
+
+    # Convert the list of features into NumPy arrays
+    X_train_mlp = np.array(training_features)
+    X_val_mlp = np.array(validation_features)
+
+    # Convert the labels
+    y_train = np.array(training_label)
+    y_val = np.array(validation_label)
+
+    # --------------------------------------------------
+    # Method 1: MLP
+    # --------------------------------------------------
+
+    X_train_mlp = np.array(training_features, dtype=np.float32)
+    X_val_mlp = np.array(validation_features, dtype=np.float32)
+
+    # Standardise features using training data only
+    scaler = StandardScaler()
+    X_train_mlp = scaler.fit_transform(X_train_mlp)
+    X_val_mlp = scaler.transform(X_val_mlp)
+
+    # Train MLP
+    mlp.fit(X_train_mlp, y_train)
+
+    # Validate MLP
+    mlp_predictions = mlp.predict(X_val_mlp)
+    mlp_accuracy = accuracy_score(y_val, mlp_predictions)
+
+    results["MLP"] = mlp_accuracy
+    print("MLP Accuracy:", mlp_accuracy)
+
+    # --------------------------------------------------
+    # Prepare RGB frames for CNNs and GoogLeNet
+    # --------------------------------------------------
+
+    # Select three frames per grip from the original 12
+    X_train_cnn = np.concatenate(
+        [frames[[2, 5, 9]] for frames in training_frames],
+        axis=0
+    ).astype(np.float32)
+
+    X_val_cnn = np.concatenate(
+        [frames[[2, 5, 9]] for frames in validation_frames],
+        axis=0
+    ).astype(np.float32)
+
+    # Each grip's label is repeated for its three frames
+    y_train_cnn = np.repeat(y_train, 3)
+    y_val_cnn = np.repeat(y_val, 3)
+
+    # --------------------------------------------------
+    # Methods 2, 3 and 4: CNNs
+    # --------------------------------------------------
+
+    cnn_methods = {
+        "Basic CNN": cnn_basic,
+        "CNN + BatchNorm": cnn_batchnorm,
+        "CNN + Augmentation": cnn_augmentation
+    }
+
+    for name, model in cnn_methods.items():
+
+        print("Training:", name)
+
+        # Train the CNN
+        model.fit(
+            X_train_cnn,
+            y_train_cnn,
+            validation_data=(X_val_cnn, y_val_cnn),
+            epochs=10,
+            batch_size=16
+        )
+
+        # Predict probabilities for validation frames
+        probabilities = model.predict(
+            X_val_cnn,
+            batch_size=16,
+            verbose=0
+        )
+
+        # Average three frame predictions per grip
+        probabilities = probabilities.reshape(len(y_val), 3)
+        grip_probabilities = np.mean(probabilities, axis=1)
+
+        # Convert probabilities to Light (0) or Firm (1)
+        predictions = (grip_probabilities >= 0.5).astype(int)
+
+        # Calculate grip-level validation accuracy
+        accuracy = accuracy_score(y_val, predictions)
+
+        results[name] = accuracy
+        print(name, "Accuracy:", accuracy)
+
+    # --------------------------------------------------
+    # Method 5: Pre-trained GoogLeNet
+    # --------------------------------------------------
+
+    print("Training: GoogLeNet")
+
+    # Extract pre-trained visual features in small batches
+    def google_features(images):
+        features = []
+
+        for i in range(0, len(images), 16):
+            batch = tf.convert_to_tensor(
+                images[i:i + 16],
+                dtype=tf.float32
+            )
+
+            output = googlenet(batch)
+            features.append(output.numpy())
+
+        return np.concatenate(features, axis=0)
+
+    # Extract visual features from the RGB frames
+    X_train_google = google_features(X_train_cnn)
+    X_val_google = google_features(X_val_cnn)
+
+    # Average the three feature vectors belonging to each grip
+    X_train_google = X_train_google.reshape(
+        len(y_train), 3, -1
+    ).mean(axis=1)
+
+    X_val_google = X_val_google.reshape(
+        len(y_val), 3, -1
+    ).mean(axis=1)
+
+    # Train Logistic Regression on GoogLeNet features
+    google_classifier.fit(X_train_google, y_train)
+
+    # Validate
+    google_predictions = google_classifier.predict(X_val_google)
+    google_accuracy = accuracy_score(y_val, google_predictions)
+
+    results["GoogLeNet"] = google_accuracy
+    print("GoogLeNet Accuracy:", google_accuracy)
+
+    # --------------------------------------------------
+    # Compare the five methods
+    # --------------------------------------------------
+
+    print("\nValidation Results:")
+
+    for name, accuracy in results.items():
+        print(name, ":", f"{accuracy:.2%}")
+
+    best_method = max(results, key=results.get)
+
+    print("\nBest Method:", best_method)
+
+    return scaler, results, best_method
 
 def evaluation():
     return 0
 
 def main():
     location = Path(__file__).resolve().parent
+
     training_features = []
+    validation_features = []
     test_features = []
 
-    for folder_name in ["Training", "Test"]:
-        folder = location / folder_name
+    training_frames = []
+    validation_frames = []
+
+    training_label = []
+    validation_label = []
+
+    # Step 1 & 2: Preprocessing & visual feature extraction
+    for folder_name in ["Training", "Validation", "Test"]:
+        folder = location / "input_data" / folder_name
         
         for video_path in sorted(folder.iterdir()):
             if video_path.suffix.lower() not in (".mp4", ".mov", ".avi"):
@@ -191,17 +363,49 @@ def main():
             frames = preprocessing(video_path)
             print(folder_name, video_path.name, frames.shape)
 
+            if "_light_" in video_path.stem.lower():
+                label = 0
+            elif "_firm_" in video_path.stem.lower():
+                label = 1
+            else:
+                raise ValueError("Unknown label: " + video_path.name)
+
             # Step 2: Visual feature extraction
             features = feature_extraction(frames)
             
             if folder_name == "Training":
                 training_features.append(features)
-            else:
-                test_features.append(features)
+                training_frames.append(frames)
+                training_label.append(label)
 
-            # Step 3: Classification
-
+            elif folder_name == "Validation":
+                validation_features.append(features)
+                validation_frames.append(frames)
+                validation_label.append(label)
             
+
+            elif folder_name == "Test":
+                test_features.append(features)
+                
+            
+    # Step 3: Classification
+    mlp = classification_mlp()
+
+    cnn_basic = classification_cnn("basic")
+    cnn_batchnorm = classification_cnn("batch")
+    cnn_augmentation = classification_cnn("augmentation")
+
+    googlenet, google_classifier = classification_googlenet()
+    
+    # Step 4: Training
+    scaler, results, best_method = model_training(
+        training_features, validation_features, 
+        training_label, validation_label,
+        training_frames, validation_frames,
+        mlp, 
+        cnn_basic, cnn_batchnorm, cnn_augmentation, 
+        googlenet, google_classifier)
+    
 
 
 if __name__ == "__main__":

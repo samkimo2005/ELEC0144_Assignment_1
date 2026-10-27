@@ -1,11 +1,14 @@
 
 # Ignore everything in this directory
 /*
+/Task_3/**
 
 # Except the Python source file
 !/Task_1.py
 !/WhatIf_Task_1.py
 !/Task_1_viva.py
+!/Task_3/
+!/Task_3/*.py
 
 # Keep .gitignore itself
 !/.gitignore
