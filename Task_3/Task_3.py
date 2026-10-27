@@ -2,6 +2,7 @@
 
 # Step 0: Setup
 from pathlib import Path
+from unicodedata import name
 import cv2
 import numpy as np
 import tensorflow as tf
@@ -331,12 +332,43 @@ def model_training(
 
     best_method = max(results, key=results.get)
 
+    print("\nResults Summary:", results)
     print("\nBest Method:", best_method)
 
-    return scaler, results, best_method
+    return scaler, best_method
+    
+# Step 5: Final Evaluation
+def evaluation(test_label, test_objects, predictions):
 
-def evaluation():
-    return 0
+    # Overall accuracy
+    overall_accuracy = accuracy_score(test_label, predictions)
+
+    # Accuracy for each object
+    object_accuracies = {}
+
+    for object_name in ["foam_ball", "rigid_bottle"]:
+        mask = np.array(test_objects) == object_name
+
+        object_accuracies[object_name] = accuracy_score(
+            np.array(test_label)[mask],
+            predictions[mask]
+        )
+
+    # Confusion matrix
+    matrix = confusion_matrix(
+        test_label, predictions, labels=[0, 1]
+    )
+
+    print("\nFinal Test Results:")
+    print("Overall Accuracy:", f"{overall_accuracy:.2%}")
+
+    for name, accuracy in object_accuracies.items():
+        print(name, "Accuracy:", f"{accuracy:.2%}")
+
+    print("Confusion Matrix:\n", matrix)
+
+    return overall_accuracy, object_accuracies, matrix
+
 
 def main():
     location = Path(__file__).resolve().parent
@@ -347,9 +379,13 @@ def main():
 
     training_frames = []
     validation_frames = []
+    test_frames = []
 
     training_label = []
     validation_label = []
+    test_label = []
+
+    test_objects = []
 
     # Step 1 & 2: Preprocessing & visual feature extraction
     for folder_name in ["Training", "Validation", "Test"]:
@@ -369,6 +405,13 @@ def main():
                 label = 1
             else:
                 raise ValueError("Unknown label: " + video_path.name)
+             
+            if "foam_ball" in video_path.stem.lower():
+                object_type = "foam_ball"
+            elif "rigid_bottle" in video_path.stem.lower():
+                object_type = "rigid_bottle"
+            else:
+                raise ValueError("Unknown object: " + video_path.name)
 
             # Step 2: Visual feature extraction
             features = feature_extraction(frames)
@@ -382,12 +425,13 @@ def main():
                 validation_features.append(features)
                 validation_frames.append(frames)
                 validation_label.append(label)
-            
 
             elif folder_name == "Test":
                 test_features.append(features)
-                
-            
+                test_frames.append(frames)
+                test_label.append(label)
+                test_objects.append(object_type)
+
     # Step 3: Classification
     mlp = classification_mlp()
 
@@ -398,15 +442,32 @@ def main():
     googlenet, google_classifier = classification_googlenet()
     
     # Step 4: Training
-    scaler, results, best_method = model_training(
+    scaler, best_method = model_training(
         training_features, validation_features, 
         training_label, validation_label,
         training_frames, validation_frames,
         mlp, 
         cnn_basic, cnn_batchnorm, cnn_augmentation, 
         googlenet, google_classifier)
-    
 
+# Step 5: Evaluation
+    models = {
+    "MLP": mlp,
+    "Basic CNN": cnn_basic,
+    "CNN + BatchNorm": cnn_batchnorm,
+    "CNN + Augmentation": cnn_augmentation,
+    "GoogLeNet": google_classifier
+    }
+    best_model = models[best_method]
+
+    test_accuracy, object_accuracies, matrix = evaluation(
+        test_features, test_frames, test_label, test_objects,
+        best_method, best_model, scaler, googlenet
+    )
+
+    print("Overall Accuracy:", test_accuracy)
+    print("Object Accuracies:", object_accuracies)
+    print("Confusion Matrix:\n", matrix)
 
 if __name__ == "__main__":
     main()
