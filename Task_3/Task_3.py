@@ -14,8 +14,11 @@ from pathlib import Path
 from unicodedata import name
 import cv2
 import numpy as np
-import tensorflow as tf
-import tensorflow_hub as hub
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, TensorDataset
+from torchvision import transforms
+from torchvision.models import googlenet as torchvision_googlenet, GoogLeNet_Weights
 import csv
 
 from sklearn.neighbors import KNeighborsClassifier
@@ -125,55 +128,44 @@ def classification_mlp():
 
 # Method 2, 3 and 4: Classification using CNN: 1. basic 2. batch normalisation 3. data augmentation
 def classification_cnn(method = "basic"):
-    model = tf.keras.Sequential([
-        tf.keras.layers.Input(shape=(224, 224, 3))
+    # PyTorch uses (channels, height, width) rather than (height, width, channels).
+    layers = [nn.Conv2d(3, 16, (3, 3), padding=1)]
+
+    if method == "batch":
+        layers.append(nn.BatchNorm2d(16))
+
+    layers.extend([nn.ReLU(), nn.MaxPool2d((2, 2))])
+
+    layers.append(nn.Conv2d(16, 32, (3, 3), padding=1))
+
+    if method == "batch":
+        layers.append(nn.BatchNorm2d(32))
+
+    layers.extend([
+        nn.ReLU(),
+        nn.MaxPool2d((2, 2)),
+        nn.AdaptiveAvgPool2d((1, 1)),
+        nn.Flatten(),
+        nn.Linear(32, 32),
+        nn.ReLU(),
+        nn.Linear(32, 1),
+        nn.Sigmoid()
     ])
 
-    # Data Augmentation
-    if method == "augmentation":
-        model.add(tf.keras.layers.RandomBrightness(
-            0.1, value_range = (0.0, 1.0)
-        ))
-
-        model.add(tf.keras.layers.RandomContrast(0.1, value_range=(0.0, 1.0)))
-
-    # First Convolutional Layer
-    model.add(tf.keras.layers.Conv2D(16, (3, 3), padding = "same"))
-
-    if method == "batch":
-        model.add(tf.keras.layers.BatchNormalization())
-
-    model.add(tf.keras.layers.ReLU())
-    model.add(tf.keras.layers.MaxPooling2D((2, 2)))
-
-    # Second Convolutional Layer
-    model.add(tf.keras.layers.Conv2D(32, (3, 3), padding="same"))
-
-    if method == "batch":
-        model.add(tf.keras.layers.BatchNormalization())
-
-    model.add(tf.keras.layers.ReLU())
-    model.add(tf.keras.layers.MaxPooling2D((2, 2)))
-
-    # Classification layer
-    model.add(tf.keras.layers.GlobalAveragePooling2D())
-    model.add(tf.keras.layers.Dense(32, activation="relu"))
-    model.add(tf.keras.layers.Dense(1, activation="sigmoid"))
-
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
-        loss="binary_crossentropy",
-        metrics=["accuracy"]
-    )
-
-    return model
+    # For "augmentation", brightness and contrast are changed during training only.
+    return nn.Sequential(*layers)
 
 # Method 5: Classification using GoogLeNet (pre-trained CNN)
 def classification_googlenet():
-    # Load pre-trained GoogLeNet
-    googlenet = hub.load(
-        "https://tfhub.dev/google/imagenet/inception_v1/feature_vector/5"
+    # Load pre-trained GoogLeNet and use its 1024-dimensional visual features.
+    googlenet = torchvision_googlenet(
+        weights=GoogLeNet_Weights.DEFAULT,
+        transform_input=False
     )
+    googlenet.fc = nn.Identity()
+    googlenet.eval()
+    for parameter in googlenet.parameters():
+        parameter.requires_grad = False
 
     # Define the binary classifier
     classifier = LogisticRegression(
@@ -192,19 +184,36 @@ def select_cnn_frames(frame_lists):
 
 
 def cnn_grip_predictions(model, images, number_of_grips):
-    probabilities = model.predict(images, batch_size=16, verbose=0)
-    probabilities = probabilities.reshape(number_of_grips, 3)
+    model.eval()
+    device = next(model.parameters()).device
+    probabilities = []
+
+    with torch.no_grad():
+        for i in range(0, len(images), 16):
+            batch = torch.from_numpy(images[i:i + 16]).permute(0, 3, 1, 2).to(device)
+            output = model(batch).squeeze(1)
+            probabilities.extend(output.cpu().numpy())
+
+    probabilities = np.array(probabilities).reshape(number_of_grips, 3)
     grip_probabilities = np.mean(probabilities, axis=1)
     return (grip_probabilities >= 0.5).astype(int)
 
 
 def google_grip_features(googlenet, images, number_of_grips):
+    googlenet.eval()
+    device = next(googlenet.parameters()).device
     features = []
 
-    for i in range(0, len(images), 16):
-        batch = tf.convert_to_tensor(images[i:i + 16], dtype=tf.float32)
-        output = googlenet(batch)
-        features.append(output.numpy())
+    # ImageNet normalisation required by the pretrained GoogLeNet weights.
+    mean = torch.tensor([0.485, 0.456, 0.406], device=device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=device).view(1, 3, 1, 1)
+
+    with torch.no_grad():
+        for i in range(0, len(images), 16):
+            batch = torch.from_numpy(images[i:i + 16]).permute(0, 3, 1, 2).to(device)
+            batch = (batch - mean) / std
+            output = googlenet(batch)
+            features.append(output.cpu().numpy())
 
     features = np.concatenate(features, axis=0)
     return features.reshape(number_of_grips, 3, -1).mean(axis=1)
@@ -257,7 +266,6 @@ def model_training(
 
     # Each grip's label is repeated for its three frames
     y_train_cnn = np.repeat(y_train, 3)
-    y_val_cnn = np.repeat(y_val, 3)
 
     # --------------------------------------------------
     # Methods 2, 3 and 4: CNNs
@@ -269,18 +277,41 @@ def model_training(
         "CNN + Augmentation": cnn_augmentation
     }
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    train_images = torch.from_numpy(X_train_cnn).permute(0, 3, 1, 2)
+    train_labels = torch.tensor(y_train_cnn, dtype=torch.float32)
+    train_loader = DataLoader(
+        TensorDataset(train_images, train_labels), batch_size=16, shuffle=True
+    )
+    augmentation = transforms.ColorJitter(brightness=0.1, contrast=0.1)
+
     for name, model in cnn_methods.items():
 
         print("Training:", name)
+        model.to(device)
+        loss_function = nn.BCELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
 
-        # Train the CNN
-        model.fit(
-            X_train_cnn,
-            y_train_cnn,
-            validation_data=(X_val_cnn, y_val_cnn),
-            epochs=10,
-            batch_size=16
-        )
+        # Train the CNN for 10 epochs with batches of 16 frames
+        for epoch in range(10):
+            model.train()
+            epoch_loss = 0.0
+
+            for images, labels in train_loader:
+                images = images.to(device)
+                labels = labels.to(device)
+
+                if name == "CNN + Augmentation":
+                    images = augmentation(images)
+
+                optimizer.zero_grad()
+                outputs = model(images).squeeze(1)
+                loss = loss_function(outputs, labels)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item() * len(labels)
+
+            print(f"Epoch {epoch + 1}/10 - loss: {epoch_loss / len(y_train_cnn):.4f}")
 
         # Predict one Light/Firm label for each validation grip
         predictions = cnn_grip_predictions(model, X_val_cnn, len(y_val))
@@ -329,55 +360,57 @@ def model_training(
     print("\nResults Summary:", results)
     print("\nBest Method:", best_method)
 
-    return scaler, best_method
+    return scaler, best_method, results
     
+
 # Step 5: Final Evaluation
-def evaluation(test_label, test_objects, predictions):
+def evaluation(test_label, test_objects, predictions_by_method):
 
-    # Overall accuracy
-    overall_accuracy = accuracy_score(test_label, predictions)
+    test_results = {}
+    labels = np.array(test_label)
+    objects = np.array(test_objects)
 
-    # Accuracy for each object
-    object_accuracies = {}
+    for method, predictions in predictions_by_method.items():
 
-    for object_name in ["foam_ball", "rigid_bottle"]:
-        mask = np.array(test_objects) == object_name
+        # Overall accuracy
+        overall_accuracy = accuracy_score(labels, predictions)
 
-        object_accuracies[object_name] = accuracy_score(
-            np.array(test_label)[mask],
-            predictions[mask]
+        # Accuracy for each object
+        object_accuracies = {}
+
+        for object_name in ["sponge", "bottle"]:
+            mask = objects == object_name
+
+            object_accuracies[object_name] = accuracy_score(
+                labels[mask], predictions[mask]
+            )
+
+        # Confusion matrix
+        matrix = confusion_matrix(labels, predictions, labels=[0, 1])
+
+        test_results[method] = (
+            overall_accuracy, object_accuracies, matrix
         )
 
-    # Confusion matrix
-    matrix = confusion_matrix(
-        test_label, predictions, labels=[0, 1]
-    )
+        print("\nTest Results:", method)
+        print("Overall Accuracy:", f"{overall_accuracy:.2%}")
 
-    print("\nFinal Test Results:")
-    print("Overall Accuracy:", f"{overall_accuracy:.2%}")
+        for name, accuracy in object_accuracies.items():
+            print(name, "Accuracy:", f"{accuracy:.2%}")
 
-    for name, accuracy in object_accuracies.items():
-        print(name, "Accuracy:", f"{accuracy:.2%}")
+        print("Confusion Matrix:\n", matrix)
 
-    print("Confusion Matrix:\n", matrix)
-
-    return overall_accuracy, object_accuracies, matrix
+    return test_results
 
 
 def main():
     location = Path(__file__).resolve().parent
 
-    with open(location / ".csv", "r", newline="") as file:
-        manifest = list(csv.reader(file))
-
-    clip_id = video_path.stem
-    record = next(row for row in manifest if row["clip_id"] == clip_id)
-    if record["grip"] == "light":
-        label = 0
-    else: 
-        label = 1
-    
-    object_type = record["object"]
+    with open(location / "input_data" / "manifest.csv", "r", newline="", encoding="utf-8-sig") as file:
+        manifest = {
+            row["clip_id"].strip().lower(): row
+            for row in csv.DictReader(file)
+        }
 
     training_features = []
     validation_features = []
@@ -400,6 +433,15 @@ def main():
         for video_path in sorted(folder.iterdir()):
             if video_path.suffix.lower() not in (".mp4", ".mov", ".avi"):
                 continue
+
+            # Get each video's label and object from the manifest
+            clip_id = video_path.stem.lower()
+            record = manifest[clip_id]
+            grip = record["grip"].strip().lower()
+            if grip not in ("light", "firm"):
+                raise ValueError("Unknown grip label: " + clip_id)
+            label = 0 if grip == "light" else 1
+            object_type = record["object"].strip().lower()
 
             # Step 1: Preprocessing
             frames = preprocessing(video_path)
@@ -434,7 +476,7 @@ def main():
     googlenet, google_classifier = classification_googlenet()
     
     # Step 4: Training
-    scaler, best_method = model_training(
+    scaler, best_method, validation_results = model_training(
         training_features, validation_features, 
         training_label, validation_label,
         training_frames, validation_frames,
@@ -442,37 +484,57 @@ def main():
         cnn_basic, cnn_batchnorm, cnn_augmentation, 
         googlenet, google_classifier)
 
-    # Step 5: Evaluation
-    models = {
-        "MLP": mlp,
-        "Basic CNN": cnn_basic,
-        "CNN + BatchNorm": cnn_batchnorm,
-        "CNN + Augmentation": cnn_augmentation,
-        "GoogLeNet": google_classifier
-    }
-    best_model = models[best_method]
-
-    # Generate predictions for the independent Test set
-    if best_method == "MLP":
-        X_test = scaler.transform(np.array(test_features, dtype=np.float32))
-        predictions = best_model.predict(X_test)
-    else:
-        X_test_cnn = select_cnn_frames(test_frames)
-
-        if best_method == "GoogLeNet":
-            X_test_google = google_grip_features(
-                googlenet, X_test_cnn, len(test_label)
-            )
-            predictions = best_model.predict(X_test_google)
-        else:
-            predictions = cnn_grip_predictions(
-                best_model, X_test_cnn, len(test_label)
-            )
-
-    # Calculate and display final Test metrics
-    test_accuracy, object_accuracies, matrix = evaluation(
-        test_label, test_objects, predictions
+    # Step 5: Evaluation of all five trained methods
+    X_test_mlp = scaler.transform(
+        np.array(test_features, dtype=np.float32)
     )
+
+    X_test_cnn = select_cnn_frames(test_frames)
+
+    X_test_google = google_grip_features(
+        googlenet, X_test_cnn, len(test_label)
+    )
+
+    predictions_by_method = {
+        "MLP": mlp.predict(X_test_mlp),
+        "Basic CNN": cnn_grip_predictions(cnn_basic, X_test_cnn, len(test_label)),
+        "CNN + BatchNorm": cnn_grip_predictions(cnn_batchnorm, X_test_cnn, len(test_label)),
+        "CNN + Augmentation": cnn_grip_predictions(cnn_augmentation, X_test_cnn, len(test_label)),
+        "GoogLeNet": google_classifier.predict(X_test_google)
+    }
+
+    test_results = evaluation(
+        test_label, test_objects, predictions_by_method
+    )
+    
+    # Calculate and display Test metrics for every method
+    test_results = evaluation(test_label, test_objects, predictions_by_method)
+
+    # Step 6: Save Validation and Test results in an Excel-readable CSV spreadsheet
+    with open(location / "Task_3_Results.csv", "w", newline="", encoding="utf-8-sig") as file:
+        writer = csv.writer(file)
+        writer.writerow(["Dataset", "Method", "Metric", "Value"])
+
+        for method, accuracy in validation_results.items():
+            writer.writerow(["Validation", method, "Accuracy (%)", round(accuracy * 100, 2)])
+
+        for method, (test_accuracy, object_accuracies, matrix) in test_results.items():
+            writer.writerow(["Test", method, "Overall accuracy (%)", round(test_accuracy * 100, 2)])
+            for object_name, accuracy in object_accuracies.items():
+                writer.writerow(["Test", method, object_name + " accuracy (%)", round(accuracy * 100, 2)])
+
+            for actual in range(2):
+                for predicted in range(2):
+                    actual_name = "Light" if actual == 0 else "Firm"
+                    predicted_name = "Light" if predicted == 0 else "Firm"
+                    writer.writerow([
+                        "Test", method,
+                        f"Actual {actual_name}, Predicted {predicted_name} (count)",
+                        int(matrix[actual, predicted])
+                    ])
+
+
+
 
 if __name__ == "__main__":
     main()
